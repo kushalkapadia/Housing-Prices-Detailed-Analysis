@@ -1,0 +1,887 @@
+---
+title: "Housing Price Prediction"
+author: "Kushal Kapadia"
+date: "February 10, 2018"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+library(knitr)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(gridExtra)
+library(scales)
+library(Rmisc)
+library(ggrepel)
+library(randomForest)
+library(psych)
+library(xgboost)
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+#Let's get started on the housing prices prediction problem. Starting in by myself. Very excited!
+#Load in the training and the testing dataset
+
+train = read.csv("D:\\ASU Stuff\\Kaggle\\Housing price prediction\\train.csv",stringsAsFactors = F)
+test = read.csv("D:\\ASU Stuff\\Kaggle\\Housing price prediction\\test.csv", stringsAsFactors = F)
+```
+Here, we can see that there are unequal number of columns for both the datasets to be combined.
+
+```{r, echo=TRUE}
+#just a quick look into how the dataset looks like
+str(train[,1:30])
+```
+Oh! So, there are many explanatory variables than we imagined. 79 to be precise (excluding the Sale Price).
+
+```{r}
+#Dimensions of both training and testing datasets
+
+paste('The dimension of training dataset is',nrow(train),'x',ncol(train))
+paste('The dimension of testing dataset is',nrow(test),'x',ncol(test))
+```
+Okay, so now we can see that the number of columns in both the datasets are not same for them to get combined.
+
+```{r}
+#So, we don't need the 'Id' and 'SalePrice' for cleaning the combined data
+test_labels <- test$Id
+test$Id <- NULL
+train$Id <- NULL
+
+test$SalePrice <- NA
+all <- rbind(train, test)
+dim(all)
+```
+So, now that we have combined two dataframes successfully, let's begin the process of data cleaning.
+
+```{r}
+#First, let's see how the response variable looks like
+
+ggplot(all[1:1460,],aes(x=train$SalePrice)) + 
+  geom_histogram()
+
+summary(train$SalePrice)
+```
+This was expected. There will always be a few number of people who'd be able to buy houses at high prices.
+
+```{r}
+#Now, to get the feel of the dataset, I'm just curious which variable has high correlation with the saleprice
+#Finding the numeric variables
+numericVars = which(sapply(all,is.numeric))
+numericVarNames = names(numericVars)
+
+paste('There are',length(numericVars),'numeric variables.')
+
+
+all_numVar <- all[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs") #correlations of all numeric variables
+
+#sort on decreasing correlations with SalePrice
+cor_sorted <- as.matrix(sort(cor_numVar[,"SalePrice"], decreasing = TRUE))
+ #select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt")
+```
+Evidently, OverallQuality has the highest correlation with the SalePrice.
+
+
+```{r}
+#A look-through into the Overall-quality
+ggplot(all[1:1460,],aes(x=factor(OverallQual), y=SalePrice)) +
+  geom_boxplot(col = 'blue') + 
+  scale_y_continuous(breaks = seq(0,800000,by = 100000), labels = comma) + 
+  xlab("Overall Quality")
+  
+```
+Thus, from the boxplots, it becomes very clear that 1-10 for Overall quality means v.bad - v.excellent. So, in order to have 'v.excellent' overall quality, you need to pay more for the houses.
+
+```{r}
+#Second most important correlation with SalePrice: GrLivArea
+ggplot(all[1:1460,], aes(x=GrLivArea, y=SalePrice)) + 
+  geom_point(col = 'blue') + 
+  geom_smooth(method = 'lm', se = F, col = 'black', aes(group=1)) + 
+  scale_y_continuous(breaks = seq(0,800000,by = 100000), labels = comma) 
+  
+
+which(all$SalePrice>150000 & all$SalePrice<200000 & all$GrLivArea > 4000) #the two points that seem like outliers. We're not gonna take them out right now but will keep both of those in our mind for the later investigation.
+```
+
+
+
+```{r}
+#Let's check how many missing values do we have in our dataset
+paste('Total number of missing values are',sum(is.na(all)))
+
+NAcol = which(colSums(is.na(all))>0)
+sort(colSums(sapply(all[NAcol],is.na)),decreasing = T)
+
+paste('There are',length(NAcol),'missing columns')
+```
+Here, the missing values in SalePrice are obvious because that is what we have to predict. So, we just have to deal with 34 columns. 1 less. Nice!
+
+
+```{r}
+#Now, the journey of data cleaning begins
+#Let's create tabs for easy understanding and readability
+
+###Analysis of Pool variables
+all$PoolQC[is.na(all$PoolQC)] = 'None'
+
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+
+all$PoolQC<-as.integer(revalue(all$PoolQC, Qualities))
+table(all$PoolQC)
+
+#Now, poolarea is related to poolQc
+all[all$PoolArea>0 & all$PoolQC==0, c('PoolArea', 'PoolQC', 'OverallQual')]
+
+#Hence on the basis of overall quality
+all$PoolQC[2421] = 2
+all$PoolQC[2504] = 3
+all$PoolQC[2600] = 2
+```
+
+
+```{r}
+###Misc feature
+#We have 2814 missing values
+
+all$MiscFeature[is.na(all$MiscFeature)] = 'None'
+all$MiscFeature = as.factor(all$MiscFeature)
+
+ggplot(all[1:1460,], aes(x = MiscFeature, y = SalePrice))+
+  geom_bar(stat = 'summary', fun.y = 'median',fill = 'blue')+
+  scale_y_continuous(breaks = seq(0,800000,by = 100000), labels = comma)+
+  geom_label(stat = 'count', aes(label = ..count.., y = ..count..))
+
+table(all$MiscFeature)
+```
+
+
+```{r}
+#Alley variable now
+#As we can see Alley has 2721 NA's
+
+all$Alley[is.na(all$Alley)] = 'None'
+all$Alley = as.factor(all$Alley)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x = Alley, y = SalePrice)) + 
+  geom_bar(stat = 'summary', fun.y = 'median', fill = 'blue')+
+  scale_y_continuous(breaks = seq(0,800000, by = 100000), labels = comma)
+
+table(all$Alley)
+```
+
+```{r}
+#Fence now.
+#There are 2348 missing values in Fence
+#Looks like an ordinal variable
+
+all$Fence[is.na(all$Fence)] = 'None'
+table(all$Fence)
+
+all$Fence = as.factor(all$Fence)
+```
+
+```{r}
+#Fireplacequ
+#There are 1420 missing values here
+
+all$FireplaceQu[is.na(all$FireplaceQu)] = 'None'
+all$FireplaceQu = as.integer(revalue(all$FireplaceQu,Qualities))
+table(all$FireplaceQu)
+
+#Fireplaces
+##########There are no missing values here but why not convert this to a factor?
+```
+
+```{r}
+#Lot variables
+#Lot Frontage has 486 missing values
+
+all[,c('Neighborhood','LotFrontage')] %>% group_by(Neighborhood) %>% summarise(median = median(LotFrontage,na.rm=T))
+
+for (i in 1:nrow(all)){
+        if(is.na(all$LotFrontage[i])){
+               all$LotFrontage[i] <- as.integer(median(all$LotFrontage[all$Neighborhood==all$Neighborhood[i]], na.rm=TRUE)) 
+        }
+}
+
+#Lot shape
+all$LotShape = factor(all$LotShape, levels = c("IR3", "IR2", "IR1", "Reg"), labels = c(0,1,2,3))
+
+#LotConfig
+all$LotConfig = as.factor(all$LotConfig)
+```
+
+```{r}
+#Garage variables
+
+#Garage year built
+all$GarageYrBlt[is.na(all$GarageYrBlt)] = all$YearBuilt[is.na(all$GarageYrBlt)]
+
+#Garage Finish
+#The values are ordinal
+
+all$GarageFinish[is.na(all$GarageFinish)] = 'None'
+Finish = c('None'=0, 'Unf'=1, 'Rfn'=2, 'Fin'=3)
+
+all$GarageFinish<-as.integer(revalue(all$GarageFinish, Finish))
+
+#Garage Qual
+#Ordinal again
+
+all$GarageQual[is.na(all$GarageQual)] = 'None'
+all$GarageQual<-as.integer(revalue(all$GarageQual, Qualities))
+table(all$GarageQual)
+
+
+#Garagecondition
+#159 missing values
+#looks like an ordinal variable
+
+all$GarageCond[is.na(all$GarageCond)] = 'None'
+all$GarageCond = as.integer(revalue(all$GarageCond,Qualities))
+table(all$GarageCond)
+
+#Garage type
+all$GarageType[is.na(all$GarageType)] = 'No Garage'
+all$GarageType = as.factor(all$GarageType)
+table(all$GarageType)
+
+#Garage cars
+which(is.na(all$GarageCars)) #2577
+all$GarageCars[2577] = 0
+
+#Garage Area
+which(is.na(all$GarageArea))
+all$GarageArea[2577] = 0
+```
+
+```{r}
+#Basement variable
+
+#Basement quality first
+#81 missing values
+
+all$BsmtQual[is.na(all$BsmtQual)] = 'None'
+all$BsmtQual = as.integer(revalue(all$BsmtQual, Qualities))
+table(all$BsmtQual)
+
+#BsmntCond
+
+all$BsmtCond[is.na(all$BsmtCond)] <- 'None'
+all$BsmtCond<-as.integer(revalue(all$BsmtCond, Qualities))
+table(all$BsmtCond)
+
+#BsmtExposure
+
+all$BsmtExposure[is.na(all$BsmtExposure)] <- 'None'
+Exposure <- c('None'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)
+
+all$BsmtExposure<-as.integer(revalue(all$BsmtExposure, Exposure))
+table(all$BsmtExposure)
+
+#BsmtFinType1
+all$BsmtFinType1[is.na(all$BsmtFinType1)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+all$BsmtFinType1<-as.integer(revalue(all$BsmtFinType1, FinType))
+table(all$BsmtFinType1)
+
+#BsmtFinType2
+all$BsmtFinType2[is.na(all$BsmtFinType2)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+all$BsmtFinType2<-as.integer(revalue(all$BsmtFinType2, FinType))
+table(all$BsmtFinType2)
+
+#BsmtFullbath
+all$BsmtFullBath[is.na(all$BsmtFullBath)] <-0
+table(all$BsmtFullBath)
+
+#BsmtHalfbath
+all$BsmtHalfBath[is.na(all$BsmtHalfBath)] <-0
+table(all$BsmtHalfBath)
+
+#BsmtFinSF1
+all$BsmtFinSF1[is.na(all$BsmtFinSF1)] <-0
+
+#BsmtFinSF2
+all$BsmtFinSF2[is.na(all$BsmtFinSF2)] <-0
+
+#BsmtUnfSF
+all$BsmtUnfSF[is.na(all$BsmtUnfSF)] <-0
+
+#TotalBsmtSF
+all$TotalBsmtSF[is.na(all$TotalBsmtSF)] <-0
+```
+
+```{r}
+#Masonary variables
+length(which(is.na(all$MasVnrType) & is.na(all$MasVnrArea)))
+all[is.na(all$MasVnrType) & !is.na(all$MasVnrArea), c('MasVnrType', 'MasVnrArea')]
+all$MasVnrType[2611] <- names(sort(-table(all$MasVnrType)))[2] #taking the 2nd value as the 1st is 'none'
+all[2611, c('MasVnrType', 'MasVnrArea')]
+
+#Masonary veneer type
+all$MasVnrType[is.na(all$MasVnrType)] <- 'None'
+
+all[!is.na(all$SalePrice),] %>% group_by(MasVnrType) %>% summarise(median = median(SalePrice), counts=n()) %>% arrange(median)
+
+#This is important. The values in median seems to have a different range. So, we can consider this as an ordinal variable
+Masonry <- c('None'=0, 'BrkCmn'=0, 'BrkFace'=1, 'Stone'=2)
+all$MasVnrType<-as.integer(revalue(all$MasVnrType, Masonry))
+table(all$MasVnrType)
+
+#Masonary area
+all$MasVnrArea[is.na(all$MasVnrArea)] <-0
+```
+
+```{r}
+#MSzoning
+
+all$MSZoning[is.na(all$MSZoning)] = 'RL'
+all$MSZoning = as.factor(all$MSZoning)
+```
+
+```{r}
+#kitchen qual
+all$KitchenQual[is.na(all$KitchenQual)] <- 'TA' #replace with most common value
+all$KitchenQual<-as.integer(revalue(all$KitchenQual, Qualities))
+table(all$KitchenQual)
+```
+
+```{r}
+#Utilities
+all$Utilities <- NULL
+```
+
+```{r}
+#Home functionality
+all$Functional[is.na(all$Functional)] <- names(sort(-table(all$Functional)))[1]
+
+all$Functional <- as.integer(revalue(all$Functional, c('Sal'=0, 'Sev'=1, 'Maj2'=2, 'Maj1'=3, 'Mod'=4, 'Min2'=5, 'Min1'=6, 'Typ'=7)))
+table(all$Functional)
+```
+
+```{r}
+#Exterior1st
+all$Exterior1st[is.na(all$Exterior1st)] <- names(sort(-table(all$Exterior1st)))[1]
+
+all$Exterior1st <- as.factor(all$Exterior1st)
+
+#Exterior2nd
+all$Exterior2nd[is.na(all$Exterior2nd)] <- names(sort(-table(all$Exterior2nd)))[1]
+
+all$Exterior2nd <- as.factor(all$Exterior2nd)
+
+#ExterQual
+all$ExterQual<-as.integer(revalue(all$ExterQual, Qualities))
+
+#External condition
+all$ExterCond<-as.integer(revalue(all$ExterCond, Qualities))
+```
+
+```{r}
+#Electrcal system
+all$Electrical[is.na(all$Electrical)] <- names(sort(-table(all$Electrical)))[1]
+
+all$Electrical <- as.factor(all$Electrical)
+```
+
+```{r}
+#saletype
+all$SaleType[is.na(all$SaleType)] <- names(sort(-table(all$SaleType)))[1]
+
+all$SaleType <- as.factor(all$SaleType)
+
+#salecondition
+all$SaleCondition <- as.factor(all$SaleCondition)
+```
+
+So, now I have made sure that all the NA's have been taken care of.Now, we'll take all the character variables.
+
+```{r}
+Charcol <- names(all[,sapply(all, is.character)])
+Charcol
+
+cat('There are', length(Charcol), 'remaining columns with character values')
+```
+
+```{r}
+#Foundation
+all$Foundation = as.factor(all$Foundation)
+
+#Heating
+all$Heating = as.factor(all$Heating)
+#HeatingQC
+all$HeatingQC = as.integer(revalue(all$HeatingQC, Qualities))
+#CentralAir
+all$CentralAir = as.integer(revalue(all$CentralAir, c('N'=0, 'Y'=1)))
+
+#roof
+all$RoofStyle = as.factor(all$RoofStyle)
+#roofmaterial
+all$RoofMatl = as.factor(all$RoofMatl)
+
+#Land
+all$LandContour = as.factor(all$LandContour)
+#Land slope
+all$LandSlope<-as.integer(revalue(all$LandSlope, c('Sev'=0, 'Mod'=1, 'Gtl'=2)))
+
+#Dwelling
+all$BldgType = as.factor(all$BldgType)
+#Housestyle
+all$HouseStyle = as.factor(all$HouseStyle)
+
+#Neighborhood
+all$Neighborhood = as.factor(all$Neighborhood)
+all$Condition1 = as.factor(all$Condition1)
+all$Condition2 = as.factor(all$Condition2)
+
+#street
+all$Street<-as.integer(revalue(all$Street, c('Grvl'=0, 'Pave'=1)))
+all$PavedDrive<-as.integer(revalue(all$PavedDrive, c('N'=0, 'P'=1, 'Y'=2)))
+```
+
+```{r}
+#Converting some more numeric variables into factors
+all$MoSold = as.factor(all$MoSold)
+
+all$MSSubClass = as.factor(all$MSSubClass)
+all$MSSubClass = revalue(all$MSSubClass, c('20'='1 story 1946+', '30'='1 story 1945-', '40'='1 story unf attic', '45'='1,5 story unf', '50'='1,5 story fin', '60'='2 story 1946+', '70'='2 story 1945-', '75'='2,5 story all ages', '80'='split/multi level', '85'='split foyer', '90'='duplex all style/age', '120'='1 story PUD 1946+', '150'='1,5 story PUD all', '160'='2 story PUD 1946+', '180'='PUD multilevel', '190'='2 family conversion')) #For better readability
+str(all$MSSubClass)
+```
+Visualization of important variables
+
+```{r}
+#Now we are just interested in finding out how many numerica and categorical variables do we have now. This is what we should do.
+
+numericVars = which(sapply(all, is.numeric))
+factorVars = which(sapply(all, is.factor))
+cat('There are', length(numericVars), 'numeric variables and',length(factorVars), 'categorical variables')
+```
+
+```{r}
+#Let's try to do the variable importance with the help of random forest now
+
+set.seed(2018)
+quick_RF = randomForest(x = all[1:1460,-79], y=all$SalePrice[1:1460], ntree = 100, importance = T)
+imp_RF = importance(quick_RF)
+imp_DF = data.frame(Variables = row.names(imp_RF), MSE = imp_RF[,1])
+imp_DF = imp_DF[order(imp_DF$MSE,decreasing = T),]
+
+ggplot(imp_DF[1:20,], aes(x=reorder(Variables,MSE), y=MSE, fill=MSE)) + geom_bar(stat = 'identity') + labs(x='Variables', y='% increase in MSE if variable is randomly permuted') + coord_flip() + theme(legend.position = 'none')
+```
+So, we can see that 3 of the most important variable are categorical i.e. Neighborhood, MSsubClass and GarageType.
+
+```{r}
+s1 = ggplot(all, aes(x=all$GrLivArea)) + 
+    geom_density()+
+    xlab("Square feey living area")
+s2 <- ggplot(data=all, aes(x=as.factor(TotRmsAbvGrd))) +
+        geom_histogram(stat='count') + labs(x='Rooms above Ground')
+s3 <- ggplot(data= all, aes(x=X1stFlrSF)) +
+        geom_density() + labs(x='Square feet first floor')
+s4 <- ggplot(data= all, aes(x=X2ndFlrSF)) +
+        geom_density() + labs(x='Square feet second floor')
+s5 <- ggplot(data= all, aes(x=TotalBsmtSF)) +
+        geom_density() + labs(x='Square feet basement')
+s6 <- ggplot(data= all[all$LotArea<100000,], aes(x=LotArea)) +
+        geom_density() + labs(x='Square feet lot')
+s7 <- ggplot(data= all, aes(x=LotFrontage)) +
+        geom_density() + labs(x='Linear feet lot frontage')
+s8 <- ggplot(data= all, aes(x=LowQualFinSF)) +
+        geom_histogram() + labs(x='Low quality square feet 1st & 2nd')
+
+layout <- matrix(c(1,2,5,3,4,8,6,7),4,2,byrow=TRUE)
+multiplot(s1, s2, s3, s4, s5, s6, s7, s8, layout=layout)
+```
+
+```{r}
+#Analysis of the most important categorical variable: Neighborhood
+n1 = ggplot(all[!is.na(all$SalePrice),], aes(x=Neighborhood, y=SalePrice)) + 
+     geom_bar(stat = 'summary', fun.y = 'median', fill = 'blue') + 
+     theme(axis.title.x = element_text(angle = 45, hjust = 1)) + 
+     geom_label(stat = 'count', aes(label = ..count.., y = ..count..), size=3) +
+     scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+     geom_hline(yintercept = 163000, linetype = 'dashed', color = 'red')
+
+n2 <- ggplot(data=all, aes(x=Neighborhood)) +
+        geom_histogram(stat='count')+
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3)+
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+grid.arrange(n1, n2)
+``` 
+
+```{r}
+#Overall quality and other variables
+q1 <- ggplot(data=all, aes(x=as.factor(OverallQual))) +
+        geom_histogram(stat='count')
+q2 <- ggplot(data=all, aes(x=as.factor(ExterQual))) +
+        geom_histogram(stat='count')
+q3 <- ggplot(data=all, aes(x=as.factor(BsmtQual))) +
+        geom_histogram(stat='count')
+q4 <- ggplot(data=all, aes(x=as.factor(KitchenQual))) +
+        geom_histogram(stat='count')
+q5 <- ggplot(data=all, aes(x=as.factor(GarageQual))) +
+        geom_histogram(stat='count')
+q6 <- ggplot(data=all, aes(x=as.factor(FireplaceQu))) +
+        geom_histogram(stat='count')
+q7 <- ggplot(data=all, aes(x=as.factor(PoolQC))) +
+        geom_histogram(stat='count')
+
+layout <- matrix(c(1,2,8,3,4,8,5,6,7),3,3,byrow=TRUE)
+multiplot(q1, q2, q3, q4, q5, q6, q7, layout=layout)
+```
+
+```{r}
+#MSSubClass
+ms1 <- ggplot(all[!is.na(all$SalePrice),], aes(x=MSSubClass, y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+ms2 <- ggplot(data=all, aes(x=MSSubClass)) +
+        geom_histogram(stat='count')+
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+grid.arrange(ms1, ms2)
+
+```
+
+```{r}
+#Garage variables
+all$GarageYrBlt[2593] <- 2007
+
+g1 <- ggplot(data=all[all$GarageCars !=0,], aes(x=GarageYrBlt)) +
+        geom_histogram()
+g2 <- ggplot(data=all, aes(x=as.factor(GarageCars))) +
+        geom_histogram(stat='count')
+g3 <- ggplot(data= all, aes(x=GarageArea)) +
+        geom_density()
+g4 <- ggplot(data=all, aes(x=as.factor(GarageCond))) +
+        geom_histogram(stat='count')
+g5 <- ggplot(data=all, aes(x=GarageType)) +
+        geom_histogram(stat='count')
+g6 <- ggplot(data=all, aes(x=as.factor(GarageQual))) +
+        geom_histogram(stat='count')
+g7 <- ggplot(data=all, aes(x=as.factor(GarageFinish))) +
+        geom_histogram(stat='count')
+
+layout <- matrix(c(1,5,5,2,3,8,6,4,7),3,3,byrow=TRUE)
+multiplot(g1, g2, g3, g4, g5, g6, g7, layout=layout)
+```
+
+```{r}
+#Basement variables
+b1 <- ggplot(data=all, aes(x=BsmtFinSF1)) +
+        geom_histogram() + labs(x='Type 1 finished square feet')
+b2 <- ggplot(data=all, aes(x=BsmtFinSF2)) +
+        geom_histogram()+ labs(x='Type 2 finished square feet')
+b3 <- ggplot(data=all, aes(x=BsmtUnfSF)) +
+        geom_histogram()+ labs(x='Unfinished square feet')
+b4 <- ggplot(data=all, aes(x=as.factor(BsmtFinType1))) +
+        geom_histogram(stat='count')+ labs(x='Rating of Type 1 finished area')
+b5 <- ggplot(data=all, aes(x=as.factor(BsmtFinType2))) +
+        geom_histogram(stat='count')+ labs(x='Rating of Type 2 finished area')
+b6 <- ggplot(data=all, aes(x=as.factor(BsmtQual))) +
+        geom_histogram(stat='count')+ labs(x='Height of the basement')
+b7 <- ggplot(data=all, aes(x=as.factor(BsmtCond))) +
+        geom_histogram(stat='count')+ labs(x='Rating of general condition')
+b8 <- ggplot(data=all, aes(x=as.factor(BsmtExposure))) +
+        geom_histogram(stat='count')+ labs(x='Walkout or garden level walls')
+
+layout <- matrix(c(1,2,3,4,5,9,6,7,8),3,3,byrow=TRUE)
+multiplot(b1, b2, b3, b4, b5, b6, b7, b8, layout=layout)
+```
+
+The one thing that I've been waiting for. FEATURE ENGINEERING!
+
+```{r}
+#Let's do something with the bathroom variable
+#total number of bathrooms
+
+all$TotBathrooms = all$FullBath + (all$HalfBath*0.5) + all$BsmtFullBath + (all$BsmtHalfBath*0.5)
+
+#Visualization
+tb1 = ggplot(all[!is.na(all$SalePrice),], aes(x=as.factor(TotBathrooms), y = SalePrice)) + 
+      geom_point(col = 'blue') + 
+      geom_smooth(method = 'lm', se = F, color = 'black', aes(group=1)) + 
+      scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+
+tb2 =  ggplot(all[!is.na(all$SalePrice),], aes(x=as.factor(TotBathrooms))) +
+       geom_histogram(stat = 'count')
+
+grid.arrange(tb1,tb2)
+
+cor(all$TotBathrooms[1:1460],all$SalePrice[1:1460]) #0.63 correlation
+         
+```
+
+```{r}
+#House Age, Remodeled(Yes/No) & IsNew 
+all$Remod = ifelse(all$YearBuilt == all$YearRemodAdd, 0, 1) #0 is not remodeled and 1 is yes
+all$Age = as.numeric(all$YrSold) - all$YearRemodAdd
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Age, y=SalePrice)) + 
+  geom_point(col = 'blue')+
+  geom_smooth(method = 'lm', col = 'black', se = F, aes(group=1)) +
+  scale_y_continuous(breaks = seq(0,800000, by=100000), labels = comma)
+
+#Negative correlation
+cor(all$Age[1:1460], all$SalePrice[1:1460])
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=as.factor(Remod), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=6) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        theme_grey(base_size = 18) +
+        geom_hline(yintercept=163000, linetype="dashed")
+
+#IsNew
+all$IsNew <- ifelse(all$YrSold==all$YearBuilt, 1, 0)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=as.factor(IsNew), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=6) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        theme_grey(base_size = 18) +
+        geom_hline(yintercept=163000, linetype="dashed")
+
+all$YrSold <- as.factor(all$YrSold)
+```
+
+```{r}
+#Neighborhood
+
+nb1 <- ggplot(all[!is.na(all$SalePrice),], aes(x=reorder(Neighborhood, SalePrice, FUN=median), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') + labs(x='Neighborhood', y='Median SalePrice') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+nb2 <- ggplot(all[!is.na(all$SalePrice),], aes(x=reorder(Neighborhood, SalePrice, FUN=mean), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "mean", fill='blue') + labs(x='Neighborhood', y="Mean SalePrice") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+grid.arrange(nb1, nb2)
+
+all$NeighRich[all$Neighborhood %in% c('StoneBr', 'NridgHt', 'NoRidge')] <- 2
+all$NeighRich[!all$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale', 'StoneBr', 'NridgHt', 'NoRidge')] <- 1
+all$NeighRich[all$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale')] <- 0
+```
+
+```{r}
+#Total Square feet
+all$TotalSqFeet = all$GrLivArea + all$TotalBsmtSF
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=TotalSqFeet, y=SalePrice)) + 
+  geom_point(col = 'blue')+
+  geom_smooth(method = 'lm', se=F, col = 'black', aes(group=1))+
+  scale_y_continuous(breaks = seq(0,800000, by=100000), labels = comma)
+
+cor(all$SalePrice, all$TotalSqFeet, use= "pairwise.complete.obs")
+
+cor(all$SalePrice[-c(524, 1299)], all$TotalSqFeet[-c(524, 1299)], use= "pairwise.complete.obs")
+```
+
+```{r}
+#Porch variables
+all$TotalPorchSF <- all$OpenPorchSF + all$EnclosedPorch + all$X3SsnPorch + all$ScreenPorch
+
+cor(all$SalePrice, all$TotalPorchSF, use= "pairwise.complete.obs")
+
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=TotalPorchSF, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+Prepare the data for modeling now!
+
+```{r}
+#Removing one of the variables that are highly correlated and removing that which has has the least correlation with SalePrice
+dropVars <- c('YearRemodAdd', 'GarageYrBlt', 'GarageArea', 'GarageCond', 'TotalBsmtSF', 'TotalRmsAbvGrd', 'BsmtFinSF1')
+
+all <- all[,!(names(all) %in% dropVars)]
+
+```
+
+```{r}
+#Removing outliers
+all <- all[-c(524, 1299),]
+
+#Pre-processing predictor variables
+numericVarNames <- numericVarNames[!(numericVarNames %in% c('MSSubClass', 'MoSold', 'YrSold', 'SalePrice', 'OverallQual', 'OverallCond'))] #numericVarNames was created before having done anything
+numericVarNames <- append(numericVarNames, c('Age', 'TotalPorchSF', 'TotBathrooms', 'TotalSqFeet'))
+
+DFnumeric <- all[, names(all) %in% numericVarNames]
+
+DFfactors <- all[, !(names(all) %in% numericVarNames)]
+DFfactors <- DFfactors[, names(DFfactors) != 'SalePrice']
+
+cat('There are', length(DFnumeric), 'numeric variables, and', length(DFfactors), 'factor variables')
+```
+
+```{r}
+#Skewness and normalizing of the numeric predcitors
+for(i in 1:ncol(DFnumeric)){
+        if (abs(skew(DFnumeric[,i]))>0.8){
+                DFnumeric[,i] <- log(DFnumeric[,i] +1)
+        }
+}
+## Created from 2917 samples and 30 variables
+## 
+## Pre-processing:
+##   - centered (30)
+##   - ignored (0)
+##   - scaled (30)
+
+DFnorm <- predict(PreNum, DFnumeric)
+dim(DFnorm)
+```
+
+```{r}
+#One-hot encoding the categorical variables
+DFdummies <- as.data.frame(model.matrix(~.-1, DFfactors))
+dim(DFdummies)
+```
+
+```{r}
+#Removing levels with few or no observations in train or test
+#check if some values are absent in the test set
+ZerocolTest <- which(colSums(DFdummies[(nrow(all[!is.na(all$SalePrice),])+1):nrow(all),])==0)
+colnames(DFdummies[ZerocolTest])
+
+DFdummies <- DFdummies[,-ZerocolTest] #removing predictors
+
+#check if some values are absent in the train set
+ZerocolTrain <- which(colSums(DFdummies[1:nrow(all[!is.na(all$SalePrice),]),])==0)
+colnames(DFdummies[ZerocolTrain])
+
+DFdummies <- DFdummies[,-ZerocolTrain] #removing predictor
+
+#Also taking out variables with less than 10 'ones'
+fewOnes <- which(colSums(DFdummies[1:nrow(all[!is.na(all$SalePrice),]),])<10)
+colnames(DFdummies[fewOnes])
+
+DFdummies <- DFdummies[,-fewOnes] #removing predictors
+dim(DFdummies)
+
+combined <- cbind(DFnorm, DFdummies) #combining all (now numeric) predictors into one dataframe 
+
+
+```
+
+```{r}
+#Skewness of response variable
+skew(all$SalePrice)
+
+qqnorm(all$SalePrice)
+qqline(all$SalePrice)
+
+#Improving the skewness
+all$SalePrice <- log(all$SalePrice) #default is the natural logarithm, "+1" is not necessary as there are no 0's
+skew(all$SalePrice)
+
+qqnorm(all$SalePrice)
+qqline(all$SalePrice)
+```
+
+
+```{r}
+#Training and testing datasets
+train1 <- combined[!is.na(all$SalePrice),]
+test1 <- combined[is.na(all$SalePrice),]
+```
+
+```{r}
+#Modeling
+
+#Lasso Regression model
+set.seed(27042018)
+my_control <-trainControl(method="cv", number=5)
+lassoGrid <- expand.grid(alpha = 1, lambda = seq(0.001,0.1,by = 0.0005))
+
+lasso_mod <- train(x=train1, y=all$SalePrice[!is.na(all$SalePrice)], method='glmnet', trControl= my_control, tuneGrid=lassoGrid) 
+lasso_mod$bestTune
+
+lassoVarImp <- varImp(lasso_mod,scale=F)
+lassoImportance <- lassoVarImp$importance
+
+varsSelected <- length(which(lassoImportance$Overall!=0))
+varsNotSelected <- length(which(lassoImportance$Overall==0))
+
+cat('Lasso uses', varsSelected, 'variables in its model, and did not select', varsNotSelected, 'variables.')
+
+LassoPred <- predict(lasso_mod, test1)
+predictions_lasso <- exp(LassoPred) #need to reverse the log to the real values
+head(predictions_lasso)
+```
+
+```{r}
+#Xgboost model
+xgb_grid = expand.grid(
+nrounds = 1000,
+eta = c(0.1, 0.05, 0.01),
+max_depth = c(2, 3, 4, 5, 6),
+gamma = 0,
+colsample_bytree=1,
+min_child_weight=c(1, 2, 3, 4 ,5),
+subsample=1
+)
+
+label_train <- all$SalePrice[!is.na(all$SalePrice)]
+
+# put our testing & training data into two seperates Dmatrixs objects
+dtrain <- xgb.DMatrix(data = as.matrix(train1), label= label_train)
+dtest <- xgb.DMatrix(data = as.matrix(test1))
+
+default_param<-list(
+        objective = "reg:linear",
+        booster = "gbtree",
+        eta=0.05, #default = 0.3
+        gamma=0,
+        max_depth=3, #default=6
+        min_child_weight=4, #default=1
+        subsample=1,
+        colsample_bytree=1
+)
+
+xgbcv <- xgb.cv( params = default_param, data = dtrain, nrounds = 500, nfold = 5, showsd = T, stratified = T, print_every_n = 40, early_stopping_rounds = 10, maximize = F)
+
+#train the model using the best iteration found by cross validation
+xgb_mod <- xgb.train(data = dtrain, params=default_param, nrounds = 454)
+
+XGBpred <- predict(xgb_mod, dtest)
+predictions_XGB <- exp(XGBpred) #need to reverse the log to the real values
+head(predictions_XGB)
+
+#view variable importance plot
+library(Ckmeans.1d.dp) #required for ggplot clustering
+mat <- xgb.importance (feature_names = colnames(train1),model = xgb_mod)
+xgb.ggplot.importance(importance_matrix = mat[1:20], rel_to_first = TRUE)
+
+```
+
+
+```{r}
+#Averaging predictions
+sub_avg <- data.frame(Id = test_labels, SalePrice = (predictions_XGB+2*predictions_lasso)/3)
+head(sub_avg)
+
+write.csv(sub_avg, file = 'average.csv', row.names = F)
+
+```
+
+
